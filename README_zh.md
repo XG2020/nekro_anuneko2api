@@ -1,4 +1,6 @@
-# Anuneko OpenAI Proxy
+# Anuneko OpenAI Proxy For Nekro Agent
+
+针对Nekro Agent接入做了兼容优化处理
 
 [English](./README.md)
 
