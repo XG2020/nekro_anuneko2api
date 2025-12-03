@@ -52,25 +52,17 @@ async def chat_completions(
     # --- 流式响应 ---
     if request.stream:
         async def stream_generator():
-            # 收集所有内容，确保语义完整性
-            full_content = ""
             async for chunk_text in anuneko_client.chat_stream(chat_id, prompt):
-                full_content += chunk_text
-            
-            # 一次性包装完整内容
-            wrapped_content = f'send_msg_text(_ck, "{full_content}")'
-            
-            # 分块发送包装后的完整内容（保持流式特性）
-            chunk_resp = ChatCompletionStreamResponse(
-                id=req_id,
-                model=request.model,
-                choices=[ChatCompletionStreamChoice(
-                    index=0, 
-                    delta=DeltaMessage(content=wrapped_content),
-                    finish_reason=None
-                )]
-            )
-            yield f"data: {chunk_resp.model_dump_json()}\n\n"
+                chunk_resp = ChatCompletionStreamResponse(
+                    id=req_id,
+                    model=request.model,
+                    choices=[ChatCompletionStreamChoice(
+                        index=0, 
+                        delta=DeltaMessage(content=chunk_text),
+                        finish_reason=None
+                    )]
+                )
+                yield f"data: {chunk_resp.model_dump_json()}\n\n"
             
             # 结束标记
             final_resp = ChatCompletionStreamResponse(
@@ -93,15 +85,12 @@ async def chat_completions(
         async for chunk_text in anuneko_client.chat_stream(chat_id, prompt):
             full_content += chunk_text
         
-        # 在返回内容前后添加 send_msg_text(_ck, "原内容") 格式
-        wrapped_content = f'send_msg_text(_ck, "{full_content}")'
-        
         return ChatCompletionResponse(
             id=req_id,
             model=request.model,
             choices=[ChatCompletionResponseChoice(
                 index=0,
-                message=Message(role="assistant", content=wrapped_content)
+                message=Message(role="assistant", content=full_content)
             )]
         )
 
