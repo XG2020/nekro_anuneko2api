@@ -21,9 +21,9 @@ class AnunekoClient:
         if settings.ANUNEKO_COOKIE:
             self.headers["Cookie"] = settings.ANUNEKO_COOKIE
 
-        # 缓存：用户ID -> Chat ID
-        # 每个用户拥有独立的会话
-        self.user_chat_map = {} 
+        # 缓存：对话指纹 -> Chat ID
+        # 指纹通常由对话的第一条消息决定
+        self.fingerprint_map = {} 
         
         # 缓存：Chat ID -> 当前模型
         self.chat_model_map = {}
@@ -35,90 +35,58 @@ class AnunekoClient:
             return "Exotic Shorthair" # 黑猫
         return "Orange Cat" # 默认橘猫
 
-    def _extract_user_id(self, messages: List[Message]) -> str:
+    def _extract_chat_key(self, content: str) -> str:
         """
-        从消息中提取用户ID。
-        策略：查找包含"Current Chat Key:"的消息，提取其中的用户ID。
-        如果找不到，则使用默认用户ID。
+        从消息内容中提取Current Chat Key
+        格式通常为：onebot_v11-group_685782298、onebot_v11-private_2139954865、tg-private_545646485等
         """
-        if not messages:
-            return "default_user"
-        
-        # 查找包含用户ID的消息
-        for message in messages:
-            if "Current Chat Key:" in message.content:
-                # 提取用户ID
-                parts = message.content.split("Current Chat Key:")
-                if len(parts) > 1:
-                    # 获取用户ID部分（通常是第一个词）
-                    user_id_part = parts[1].split()[0].strip()
-                    return user_id_part
-        
-        # 如果没有找到用户ID，返回默认用户ID
-        return "default_user"
-
+        # 查找Current Chat Key: 后面的内容
+        import re
+        match = re.search(r'Current Chat Key: ([\w\-]+)', content)
+        if match:
+            return match.group(1)
+        return "default_key"
+    
     def _clean_message_content(self, content: str) -> str:
         """
-        清理消息内容，移除元数据但保留用户实际内容。
+        去除消息开头的特定字段
         """
-        if "Current Chat Key:" not in content:
-            return content.strip()
+        # 使用正则表达式匹配并移除开头的特定字段
+        import re
+        # 匹配从开头到'Recent Messages:'（包括）的所有内容
+        pattern = r'^Continue\. Next is a real user conversation scene\. Note that the sandbox before this has been cleaned up, and do not use the previously generated resources\. Current Chat Key: [\w\-]+ Current Time: [^|]+ \| 农历: [^\n]+ Recent Messages: '  
+        cleaned_content = re.sub(pattern, '', content, count=1)
         
-        # 分割消息内容
-        lines = content.split('\n')
-        cleaned_lines = []
-        skip_mode = False
+        # 如果正则没有匹配到，尝试更简单的方式
+        if cleaned_content == content:
+            # 尝试找到'Recent Messages:'后截取
+            recent_pos = content.find('Recent Messages:')
+            if recent_pos > 0:
+                return content[recent_pos:].strip()
         
-        for line in lines:
-            # 开始跳过元数据部分
-            if "Current Chat Key:" in line:
-                skip_mode = True
-                continue
-            
-            # 如果正在跳过元数据，检查是否遇到实际内容
-            if skip_mode:
-                # 如果遇到空行，继续跳过
-                if line.strip() == "":
-                    continue
-                # 如果遇到看起来像是实际用户内容的行，停止跳过
-                else:
-                    skip_mode = False
-                    cleaned_lines.append(line.strip())
-            else:
-                # 正常添加非元数据行
-                if line.strip():
-                    cleaned_lines.append(line.strip())
-        
-        # 如果没有找到实际内容，尝试从原始内容中提取
-        if not cleaned_lines:
-            # 查找可能包含实际内容的行
-            for line in lines:
-                line = line.strip()
-                # 跳过明显的元数据行
-                if (line and 
-                    "Current Chat Key:" not in line and
-                    "Current Time:" not in line and
-                    "Recent Messages:" not in line and
-                    "msg_id:" not in line and
-                    not line.startswith("|") and
-                    not line.startswith("(") and
-                    not line.startswith("[") and
-                    len(line) > 2):  # 确保内容不太短
-                    cleaned_lines.append(line)
-        
-        result = ' '.join(cleaned_lines).strip()
-        return result if result else content.strip()
-
+        return cleaned_content
+    
     def _generate_fingerprint(self, messages: List[Message]) -> str:
         """
         生成对话指纹。
-        策略：取第一条消息（通常是System或第一条User）的内容进行Hash。
-        这样只要对话开头不变，就被视为同一个 session。
+        策略：从消息中提取Current Chat Key作为指纹基准。
+        这样相同的Current Chat Key会对应到同一个session。
         """
         if not messages:
             return "empty"
         
-        # 使用第一条消息的内容作为指纹基准
+        # 从最后一条用户消息中提取Chat Key作为指纹基准
+        last_user_msg = None
+        for msg in reversed(messages):
+            if msg.role == "user":
+                last_user_msg = msg
+                break
+        
+        if last_user_msg:
+            chat_key = self._extract_chat_key(last_user_msg.content)
+            return chat_key
+        
+        # 如果找不到用户消息，使用第一条消息内容作为备选方案
         base_content = messages[0].content
         return hashlib.md5(base_content.encode('utf-8')).hexdigest()
 
@@ -128,27 +96,22 @@ class AnunekoClient:
         返回: (chat_id, prompt_to_send)
         """
         target_model = self._get_api_model_name(model_input)
-        user_id = self._extract_user_id(messages)
+        fingerprint = self._generate_fingerprint(messages)
         
-        # 提取最后一条用户消息作为发送内容，并清理其中的元数据
+        # 提取最后一条用户消息作为发送内容，并清理消息内容
         last_msg = messages[-1]
-        if last_msg.role == "user":
-            # 使用新的清理函数处理用户消息
-            prompt = self._clean_message_content(last_msg.content)
-        else:
-            prompt = "..."
+        raw_prompt = last_msg.content if last_msg.role == "user" else "..."
+        prompt = self._clean_message_content(raw_prompt)
 
-        chat_id = None
-        
-        # 检查该用户是否已有会话
-        chat_id = self.user_chat_map.get(user_id)
+        # 优先从缓存中查找会话，不再根据消息长度判断是否为新对话
+        chat_id = self.fingerprint_map.get(fingerprint)
 
-        # 如果没有找到现有会话，则创建新的会话
+        # 如果没有找到现有会话，则创建新会话
         if not chat_id:
             chat_id = await self._create_session(target_model)
             if chat_id:
-                # 更新用户会话映射
-                self.user_chat_map[user_id] = chat_id
+                # 更新指纹映射
+                self.fingerprint_map[fingerprint] = chat_id
                 self.chat_model_map[chat_id] = target_model
             else:
                 raise Exception("Failed to create upstream session")
